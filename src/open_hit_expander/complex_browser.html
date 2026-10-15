@@ -1,0 +1,165 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>
+*{box-sizing:border-box}body{font:13px system-ui,sans-serif;margin:0;color:#25313d;background:#fff}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}button,select{font:inherit;padding:6px;border:1px solid #bac5cf;border-radius:4px;background:#fff}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}select{max-width:100%}.job{width:560px}.model{width:480px}.slider{width:480px}.scene{display:grid;grid-template-columns:260px minmax(514px,1fr);gap:16px;align-items:start;min-width:790px}.details{flex:0 0 260px;overflow-wrap:anywhere}.right{flex:1;min-width:514px}#viewer{height:500px;width:100%;position:relative}.residue-tooltip{position:absolute;left:12px;bottom:12px;z-index:4;padding:6px 10px;background:rgba(255,255,255,.94);border:1px solid #bac5cf;border-radius:4px;color:#25313d;font-weight:600;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.08)}.residue-tooltip[hidden]{display:none}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:5px 3px;border-bottom:1px solid #eee}th{width:42%;font-weight:500}.viewer-layout{display:grid;grid-template-columns:minmax(514px,1fr) 210px;gap:12px;align-items:start}.legend{display:flex;flex-direction:column;gap:8px;min-width:0;padding:8px 0}.legend h3{margin:0 0 4px}.tag{display:block;border-left:4px solid currentColor;border-radius:3px;padding:7px 8px;font-weight:600;overflow-wrap:anywhere;background:#f7f9fb}.tag.current{background:#eff4f8}.tag small{display:block;color:#687684;font-weight:400;margin-top:3px}@media(max-width:1050px){.viewer-layout{grid-template-columns:minmax(514px,1fr)}.legend{flex-direction:row;flex-wrap:wrap}.legend h3{width:100%}}.note,#status{font-size:12px;color:#687684;margin-top:8px}#error{color:#a92323}label{white-space:nowrap}h3{font-size:15px;margin:6px 0 10px}@media(max-width:720px){.slider{width:65%}}
+</style>
+<script src="https://3dmol.org/build/3Dmol-min.js"></script></head><body>
+<h3>Boltz overlay viewer v0.4</h3>
+<div class="controls"><select id="job" class="job" aria-label="Complex"></select><span id="position"></span></div>
+<div class="controls"><button id="previous">Previous</button><button id="next">Next</button><input id="slider" class="slider" aria-label="Result" type="range" min="0" step="1"></div>
+<div class="controls"><select id="model" class="model" aria-label="Model"></select><label><input id="bestoverlay" type="checkbox"> Compare highest-pIC50 pose</label><span id="bestinfo" class="note"></span></div>
+<div class="controls"><label><input id="freeze" type="checkbox"> Hold current complex</label><select id="frozen" aria-label="Frozen reference"></select><button id="remove">Remove selected</button><button id="clear">Clear frozen</button></div>
+<div class="controls"><label><input id="focus" type="checkbox" checked>Focus ligand</label><label><input id="showprotein" type="checkbox" checked>Show protein</label><label><input id="pocket" type="checkbox" checked>Nearby residue sticks</label><label>Radius (Å) <input id="radius" type="number" min="3" max="10" step="0.5" value="5" style="width:55px"></label><label><input id="proteins" type="checkbox">Show frozen proteins</label><button id="reset">Reset view</button></div>
+<div id="held" class="controls" aria-label="Held molecules"></div>
+<div class="scene"><div class="details"><h3>Prediction details</h3><table id="metrics"></table><p class="note">Metrics refer to the parsed best-confidence model/job. Model selection changes only the displayed structure.</p><p id="alignment" class="note"></p></div><div class="right"><div class="viewer-layout"><div id="viewer"><div id="residue-tooltip" class="residue-tooltip" hidden></div></div><aside id="legend" class="legend" aria-label="Complex legend"></aside></div><div id="error" role="alert"></div><div id="status"></div></div></div>
+<script>
+const payload = __PAYLOAD__;
+const palette = ['#0072B2','#009E73','#CC79A7','#882255','#44AA99','#332288','#AA4499'];
+const activeColor = '#D55E00';
+const el = id => document.getElementById(id);
+let current = 0, modelIndex = 0, frozen = [], initialized = false;
+const jobSelect = el('job'), modelSelect = el('model');
+payload.jobs.forEach((j,i)=>jobSelect.add(new Option(`${i+1}. ${j.id}${j.parent?' [parent]':''}`, i)));
+el('slider').max = payload.jobs.length-1;
+const key = (j,m) => `${j}:${m}`;
+const selected = () => ({job:current, model:modelIndex, key:key(current,modelIndex)});
+const descriptor = r => `${payload.jobs[r.job].id} · ${payload.jobs[r.job].models[r.model].name}`;
+let viewer;
+const residueTooltip = el('residue-tooltip');
+function hideResidueTooltip(){residueTooltip.hidden=true;residueTooltip.textContent='';}
+function showResidueTooltip(atom){
+    if(!atom || !atom.resn || atom.resi===undefined)return hideResidueTooltip();
+    const insertion = atom.icode && String(atom.icode).trim() ? String(atom.icode).trim() : '';
+    residueTooltip.textContent = `${String(atom.resn).toUpperCase()} ${atom.resi}${insertion} · Chain ${atom.chain || payload.proteinChain}`;
+    residueTooltip.hidden=false;
+}
+try {viewer = $3Dmol.createViewer(el('viewer'), {backgroundColor:'white'});}
+catch(e){el('error').textContent = `Cannot initialize 3D viewer: ${e.message}. Check CDN access and WebGL.`;throw e;}
+function syncModels(){
+    modelSelect.replaceChildren();
+    payload.jobs[current].models.forEach((m,i)=>modelSelect.add(new Option(m.name+(m.error?' [unavailable]':''),i)));
+    modelSelect.value = modelIndex;
+}
+function syncFrozen(){
+    const previous = el('frozen').value;
+    el('frozen').replaceChildren();
+    frozen.forEach(r=>el('frozen').add(new Option(descriptor(r),r.key)));
+    if(frozen.some(r=>r.key===previous))el('frozen').value = previous;
+    el('remove').disabled = el('clear').disabled = !frozen.length;
+    el('held').replaceChildren();
+    frozen.forEach(ref=>{
+        const label=document.createElement('label'), box=document.createElement('input'), text=document.createElement('span');
+        box.type='checkbox';box.checked=true;box.setAttribute('aria-label',`Hold complex ${descriptor(ref)}`);
+        label.style.color=ref.color;text.textContent=descriptor(ref);
+        box.onchange=()=>{if(!box.checked){frozen=frozen.filter(r=>r.key!==ref.key);renderScene();}};
+        label.append(box,text);el('held').append(label);
+    });
+}
+function fitCamera(){
+    viewer.zoomTo(el('focus').checked ? {chain:payload.ligandChain} : {});
+    if(el('focus').checked)viewer.zoom(.8);
+}
+function drawModel(ref, isActive){
+    const model = payload.jobs[ref.job].models[ref.model];
+    if(model.error)throw new Error(model.error);
+    const mol = viewer.addModel(model.data, model.format);
+    const id = mol.getID();
+    // Clear 3Dmol.js default line styles for every atom in the new model.
+    // Otherwise hiding the cartoon can expose the default protein wireframe.
+    viewer.setStyle({model:id}, {});
+    const ligand = {model:id, chain:payload.ligandChain};
+    const protein = {model:id, chain:payload.proteinChain};
+    // Active and held proteins have independent visibility controls.
+    const showProtein = isActive ? el('showprotein').checked : el('proteins').checked;
+    const cartoon = {color:ref.color,opacity:isActive ? 0.48 : 0.35};
+    if(showProtein)viewer.setStyle(protein,{cartoon});
+    // setStyle on carbon atoms is deliberate: atom-level styles determine
+    // the colors of the two ends of each bond in 3Dmol.js.
+    viewer.setStyle(ligand,{stick:{colorscheme:'Jmol',radius:isActive ? 0.22 : 0.16}});
+    viewer.setStyle({...ligand,elem:'C'},{stick:{color:ref.color,radius:isActive ? 0.22 : 0.16}});
+    if(el('showprotein').checked && isActive && el('pocket').checked){
+        const pocket = {model:id,chain:payload.proteinChain,byres:true,within:{distance:Number(el('radius').value),sel:ligand}};
+        // Resolve the residue-expanded pocket once, then select by atom index.
+        // Keeping `byres:true` in the element-specific selectors would expand
+        // each selected heteroatom back to its ENTIRE residue.
+        const pocketIndices = mol.selectedAtoms(pocket).map(atom => atom.index);
+        const pocketAtoms = {model:id,index:pocketIndices};
+        viewer.addStyle(pocketAtoms,{stick:{colorscheme:'Jmol',radius:.1,opacity:.65}});
+        // Preserve the protein cartoon while recoloring pocket carbons.
+        viewer.setStyle({...pocketAtoms,elem:'C'}, {
+            ...(showProtein ? {cartoon} : {}),
+            stick:{color:ref.color,radius:.1,opacity:.65}
+        });
+        // Explicit element colors for protein pocket heteroatoms. Keep cartoons.
+        const elementColors = {N:'#3050F8',O:'#FF0D0D',S:'#FFFF30',P:'#FF8000',F:'#90E050',Cl:'#1FF01F',Br:'#A62929',I:'#940094'};
+        for(const [elem,color] of Object.entries(elementColors)){
+            viewer.setStyle({...pocketAtoms,elem}, {
+                ...(showProtein ? {cartoon} : {}),
+                stick:{color,radius:.1,opacity:.65}
+            });
+        }
+        // Hover the visible pocket atoms; show text in a fixed unobtrusive overlay.
+        viewer.setHoverable(pocketAtoms,true,
+            atom => showResidueTooltip(atom),
+            () => hideResidueTooltip()
+        );
+    }
+}
+function renderScene(reset=false){
+    hideResidueTooltip();
+    const camera = initialized && !reset ? viewer.getView() : null;
+    viewer.removeAllModels();
+    const active = selected();
+    const pinned = frozen.find(r=>r.key===active.key);
+    const bestIndex = payload.jobs[current].bestModelIndex;
+    const compareBest = el('bestoverlay').checked && bestIndex !== null && bestIndex !== undefined && bestIndex !== modelIndex;
+    const bestRef = compareBest ? {job:current,model:bestIndex,key:key(current,bestIndex),color:'#009E73'} : null;
+    const activeRef = {...active,color:pinned?pinned.color:activeColor,slot:pinned?pinned.slot:frozen.length};
+    el('error').textContent = '';
+    try{
+        frozen.filter(r=>r.key!==active.key).forEach(r=>drawModel(r,false));
+        drawModel(activeRef,true);
+        if(bestRef)drawModel(bestRef,false);
+        if(camera)viewer.setView(camera);else fitCamera();
+        viewer.render();initialized=true;
+    }catch(e){if(camera)viewer.setView(camera);viewer.render();el('error').textContent=e.message;}
+    const refs = [...frozen.filter(r=>r.key!==active.key),activeRef];
+    if(bestRef)refs.push(bestRef);
+    el('legend').replaceChildren();
+    const heading=document.createElement('h3');heading.textContent='Complex legend';el('legend').append(heading);
+    refs.forEach(r=>{const tag=document.createElement('div');tag.className='tag'+(r.key===active.key?' current':'');tag.style.color=r.color;const name=document.createElement('span');name.textContent=descriptor(r);const state=document.createElement('small');state.textContent=bestRef && r===bestRef?'Highest-pIC50 comparison':r.key===active.key?'Current complex':'Frozen complex';tag.append(name,state);el('legend').append(tag);});
+    const job = payload.jobs[current], model = job.models[modelIndex];
+    el('metrics').replaceChildren();
+    Object.entries(job.metrics).forEach(([name,value])=>{const tr=document.createElement('tr'),th=document.createElement('th'),td=document.createElement('td');th.textContent=name;td.textContent=value;tr.append(th,td);el('metrics').append(tr);});
+    el('alignment').textContent=model.error ? model.error : `Aligned to ${payload.alignmentReference}: ${model.caCount} Cα atoms; RMSD ${model.rmsd.toFixed(2)} Å. All coordinates transformed together.`;
+    el('bestoverlay').disabled=bestIndex===null || bestIndex===undefined || bestIndex===modelIndex;
+    el('bestinfo').textContent=bestIndex===null || bestIndex===undefined ? 'No replicate potency data' : `Best predicted pIC50: ${Number(payload.jobs[current].bestPic50).toFixed(3)}`;
+    el('position').textContent=`${current+1}/${payload.jobs.length}`;
+    el('status').textContent=`${frozen.length} frozen reference(s). Rotate/zoom/pan with the mouse; navigation preserves the camera.`;
+    jobSelect.value=current;el('slider').value=current;el('previous').disabled=current===0;el('next').disabled=current===payload.jobs.length-1;
+    el('freeze').checked=!!pinned;
+    el('freeze').disabled=(!pinned && frozen.length>=palette.length) || !!model.error;
+    syncFrozen();
+}
+function navigate(index){current=Number(index);modelIndex=0;syncModels();renderScene();}
+jobSelect.onchange=()=>navigate(jobSelect.value);
+el('slider').onchange=()=>navigate(el('slider').value);
+el('previous').onclick=()=>navigate(Math.max(0,current-1));
+el('next').onclick=()=>navigate(Math.min(payload.jobs.length-1,current+1));
+modelSelect.onchange=()=>{modelIndex=Number(modelSelect.value);renderScene();};
+el('freeze').onchange=()=>{
+    const ref=selected();
+    if(!el('freeze').checked){frozen=frozen.filter(r=>r.key!==ref.key);renderScene();return;}
+    if(frozen.some(r=>r.key===ref.key) || frozen.length>=palette.length || payload.jobs[current].models[modelIndex].error)return;
+    const slot=palette.findIndex(c=>!frozen.some(r=>r.color===c));
+    frozen.push({...ref,color:palette[slot],slot});renderScene();
+};
+el('remove').onclick=()=>{frozen=frozen.filter(r=>r.key!==el('frozen').value);renderScene();};
+el('clear').onclick=()=>{frozen=[];renderScene();};
+for(const id of ['showprotein','pocket','radius','proteins'])el(id).onchange=()=>renderScene();
+el('bestoverlay').onchange=()=>renderScene();
+el('focus').onchange=()=>renderScene(true);
+el('reset').onclick=()=>renderScene(true);
+syncModels();renderScene();
+window.addEventListener('resize',()=>{viewer.resize();viewer.render();});
+</script></body></html>

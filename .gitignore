@@ -1,0 +1,16 @@
+# Local experiment outputs (potentially large / proprietary)
+hit_expander_output/
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+# Jupyter scratch
+.ipynb_checkpoints/
+# macOS
+.DS_Store
