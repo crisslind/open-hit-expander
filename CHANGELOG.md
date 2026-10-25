@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (since 0.7.0)
+## 1.0.0 (2026-10-25)
 
 ### Added
 - Per-job resumable cofolding: rerunning section 6 computes only unfinished jobs.
