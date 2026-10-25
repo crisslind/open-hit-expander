@@ -145,6 +145,7 @@ def build_compound_assessment(results, *, details=None, status=None,
             similarities=np.nan
         rows.append({
             "job_id":job,"is_parent":is_parent,"transformation":r.get("transformation", ""),
+            "prefilter_flags":("" if pd.isna(r.get("prefilter_flags", "")) else r.get("prefilter_flags", "")),
             "ligand_smiles":r.get("ligand_smiles", ""),
             "median_pic50":val("predicted_pic50"),"mean_pic50":val("mean_pic50"),
             "sd_pic50":val("sd_pic50"),"min_pic50":val("min_pic50"),"max_pic50":val("max_pic50"),

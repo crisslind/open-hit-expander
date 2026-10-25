@@ -194,35 +194,112 @@ def summarize_stability(stability_directory: str | Path):
     return summary, df
 
 
-def plot_stability(stability_directory: str | Path, max_ligands: int = 30):
-    """Show potency replicate distributions, paired deltas, and SD per ligand."""
+# Okabe-Ito colours: distinguishable with the common forms of colour-vision deficiency.
+_IMPROVED, _MIXED, _WORSE, _PARENT = "#0072B2", "#E69F00", "#D55E00", "#000000"
+
+
+def _present(fig, name, show, save_dir):
+    """Save (optional) and show or close a figure; keeps notebooks from double-drawing."""
     import matplotlib.pyplot as plt
+    if save_dir is not None:
+        out = Path(save_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out / f"{name}.png", dpi=200, bbox_inches="tight")
+    if not show:
+        plt.close(fig)
+
+
+def _dot_range(ax, frame, value, order, colors, reference=None, reference_label=None):
+    """One row per ligand: every replicate as a dot, min-max as a line, median as a tick."""
+    for row, job in enumerate(order):
+        values = frame.loc[frame.job_id.eq(job), value].dropna().to_numpy()
+        if not len(values):
+            continue
+        color = colors[job]
+        ax.plot([values.min(), values.max()], [row, row], color=color, alpha=0.45, linewidth=2.5, zorder=1)
+        ax.scatter(values, np.full(len(values), row), s=26, color=color, alpha=0.85, zorder=2)
+        ax.plot([np.median(values)] * 2, [row - 0.32, row + 0.32], color=color, linewidth=2.2, zorder=3)
+    if reference is not None:
+        ax.axvline(reference, color=_PARENT, linestyle="--", linewidth=1, zorder=0, label=reference_label)
+    ax.set_yticks(range(len(order)), order)
+    ax.set_ylim(len(order) - 0.5, -0.5)  # best at the top
+    ax.grid(axis="x", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
+def plot_stability(stability_directory: str | Path, max_ligands: int = 30, *, show: bool = True,
+                   save_dir: str | Path | None = None):
+    """Three figures: potency per replicate, paired change vs parent, and spread vs potency.
+
+    Every replicate is drawn as a dot (with two or three replicates, box plots
+    summarise nothing), with a tick at the median and a line from minimum to
+    maximum. Pass ``save_dir`` to also write PNGs; ``show=False`` suppresses display.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     summary, df = summarize_stability(stability_directory)
-    names = summary.sort_values("mean_pic50", ascending=False)["job_id"].astype(str).head(max_ligands).tolist()
     df["job_id"] = df["job_id"].astype(str)
     summary["job_id"] = summary["job_id"].astype(str)
+    n_rep = int(df["replicate"].nunique())
+    ranked = summary.sort_values("median_pic50", ascending=False)
+    parents = ranked.loc[ranked.is_parent, "job_id"].tolist()
+    others = ranked.loc[~ranked.is_parent, "job_id"].head(max_ligands).tolist()
+    order = sorted(parents + others, key=lambda j: -float(ranked.set_index("job_id").loc[j, "median_pic50"]))
+    parent_median = float(ranked.loc[ranked.is_parent, "median_pic50"].iloc[0]) if parents else None
+    height = max(3.2, 0.3 * len(order) + 1.6)
     figures = []
-    for metric, ylabel, title in [
-        ("predicted_pic50", "Predicted pIC50", "Boltz-2 replicate potency stability"),
-        ("delta_pic50_paired", "Paired ΔpIC50 vs parent", "Predicted improvement stability")
-    ]:
-        fig, ax = plt.subplots(figsize=(max(9, len(names)*0.42), 5))
-        data = [df.loc[df.job_id.eq(name), metric].dropna().to_numpy() for name in names]
-        ax.boxplot(data, tick_labels=names, showmeans=True)
-        for i, values in enumerate(data, 1):
-            ax.scatter(np.full(len(values), i), values, alpha=0.7, s=13)
-        if metric.startswith("delta"):
-            ax.axhline(0, linestyle="--", linewidth=1)
-        ax.set(title=title, ylabel=ylabel)
-        ax.tick_params(axis="x", rotation=90)
-        fig.tight_layout()
-        figures.append(fig)
-    fig, ax = plt.subplots(figsize=(max(9, len(names)*0.42), 4))
-    by_id = summary.set_index("job_id").reindex(names)
-    ax.bar(names, by_id["sd_pic50"].fillna(0))
-    ax.set(title="Run-to-run variation", ylabel="SD of predicted pIC50")
-    ax.tick_params(axis="x", rotation=90)
+
+    # 1. Potency, one row per ligand.
+    fig, ax = plt.subplots(figsize=(8.5, height))
+    colors = {j: (_PARENT if j in parents else _IMPROVED) for j in order}
+    _dot_range(ax, df, "predicted_pic50", order, colors, parent_median, "parent median")
+    ax.set(xlabel="Predicted pIC50   (dot = one replicate, tick = median)",
+           title=f"Boltz-2 potency across {n_rep} replicate(s)")
+    if parent_median is not None:
+        ax.legend(frameon=False, loc="lower right")
     fig.tight_layout()
+    _present(fig, "stability_potency", show, save_dir)
     figures.append(fig)
-    plt.show()
+
+    # 2. Paired change versus parent, coloured by consistency across replicates.
+    analogues = [j for j in order if j not in parents]
+    if analogues:
+        deltas = {j: df.loc[df.job_id.eq(j), "delta_pic50_paired"].dropna() for j in analogues}
+        colors = {j: (_IMPROVED if len(d) and (d > 0).all() else _WORSE if len(d) and (d < 0).all() else _MIXED)
+                  for j, d in deltas.items()}
+        by_delta = sorted(analogues, key=lambda j: -(deltas[j].median() if len(deltas[j]) else -np.inf))
+        fig, ax = plt.subplots(figsize=(8.5, max(3.2, 0.3 * len(by_delta) + 1.6)))
+        _dot_range(ax, df, "delta_pic50_paired", by_delta, colors, 0.0)
+        ax.set(xlabel="ΔpIC50 versus parent, paired within each replicate",
+               title="Predicted change versus parent")
+        ax.legend(handles=[Line2D([0], [0], marker="o", linestyle="", color=c, label=t) for c, t in
+                           [(_IMPROVED, "higher in every replicate"), (_MIXED, "mixed"),
+                            (_WORSE, "lower in every replicate")]],
+                  frameon=False, loc="lower right")
+        fig.tight_layout()
+        _present(fig, "stability_delta_vs_parent", show, save_dir)
+        figures.append(fig)
+
+    # 3. Is the potency ranking noisy where it matters?
+    fig, ax = plt.subplots(figsize=(6.5, 4.6))
+    frame = summary.set_index("job_id").reindex(order)
+    spread = (frame["max_pic50"] - frame["min_pic50"]).fillna(0)
+    ax.scatter(frame["median_pic50"], spread,
+               c=[(_PARENT if j in parents else _IMPROVED) for j in order], s=34, alpha=0.85)
+    for job in list(parents) + order[:5]:
+        ax.annotate(job, (frame.loc[job, "median_pic50"], spread[job]), fontsize=7,
+                    xytext=(4, 3), textcoords="offset points")
+    ax.set(xlabel="Median predicted pIC50", ylabel="Range across replicates (max − min)",
+           title="Replicate spread versus potency")
+    ax.grid(alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    if n_rep < 4:
+        ax.text(0.99, 0.02, f"{n_rep} replicates: range shown, SD not reliable", transform=ax.transAxes,
+                ha="right", fontsize=7, color="#555555")
+    fig.tight_layout()
+    _present(fig, "stability_spread", show, save_dir)
+    figures.append(fig)
+
+    if show:
+        plt.show()
     return figures

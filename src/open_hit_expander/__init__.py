@@ -6,6 +6,7 @@ from .boltz2 import (
     collect_boltz2_replicate_results,
     collect_boltz2_results,
     load_boltz2_run,
+    plan_boltz2_replicates,
     prepare_boltz2_batch,
     run_boltz2_batch,
     run_boltz2_replicates,

@@ -3,6 +3,7 @@ from pathlib import Path
 import html
 import json
 import re
+import warnings
 import pandas as pd
 import ipywidgets as widgets
 from IPython.display import HTML, clear_output, display
@@ -227,11 +228,18 @@ def complex_browser(results, structure_root=None, ligand_chain="B", protein_chai
     if not payload["jobs"]:
         return widgets.VBox([widgets.HTML("No available complex structures. Parse a run or check structure paths.")])
     document = _browser_document(payload)
+    size_mb = len(document) / 1e6
+    if size_mb > 10:
+        print(f"Viewer payload is {size_mb:.0f} MB; notebook front ends often render this as a blank box. "
+              "Use save_complex_browser(...) to open it in a browser instead.")
     # One frame owns both the controls and the WebGL viewer. It is never replaced
     # during navigation, so VS Code output isolation cannot discard its camera.
     frame = '<iframe title="Boltz complex browser" sandbox="allow-scripts allow-same-origin" style="border:0;width:100%;height:830px" srcdoc="' + html.escape(document, quote=True) + '"></iframe>'
     output = widgets.Output()
-    output.append_display_data(HTML(frame))
+    with warnings.catch_warnings():
+        # IPython warns about any HTML() containing an <iframe>; it is intentional here.
+        warnings.simplefilter("ignore")
+        output.append_display_data(HTML(frame))
     return widgets.VBox([output], layout=widgets.Layout(width="100%"))
 
 
@@ -240,3 +248,33 @@ def _browser_document(payload):
     # Escaping prevents molecule IDs or coordinate strings closing a script tag.
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     return template.replace("__PAYLOAD__", encoded)
+
+
+THREE_DMOL_TAG = '<script src="https://3dmol.org/build/3Dmol-min.js"></script>'
+
+
+def save_complex_browser(results, output_path, structure_root=None, ligand_chain="B",
+                         protein_chain="A", three_dmol_js=None, open_in_browser=False):
+    """Write the viewer as one standalone HTML file instead of an inline notebook output.
+
+    This sidesteps notebook front-end limits (very large iframe payloads, blocked
+    scripts). By default the page loads 3Dmol.js from 3dmol.org; pass the path of a
+    downloaded ``3Dmol-min.js`` as ``three_dmol_js`` to inline it so the file works
+    offline. Returns the path written.
+    """
+    payload = browser_payload(results, structure_root, protein_chain, ligand_chain)
+    if not payload["jobs"]:
+        raise ValueError("No available complex structures. Parse a run or check structure paths.")
+    document = _browser_document(payload)
+    if three_dmol_js is not None:
+        if THREE_DMOL_TAG not in document:
+            raise RuntimeError("Viewer template no longer references 3Dmol.js by the expected tag")
+        script = Path(three_dmol_js).expanduser().read_text(encoding="utf-8")
+        document = document.replace(THREE_DMOL_TAG, "<script>" + script.replace("</script>", "<\\/script>") + "</script>", 1)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(document, encoding="utf-8")
+    if open_in_browser:
+        import webbrowser
+        webbrowser.open(path.resolve().as_uri())
+    return path

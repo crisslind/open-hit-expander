@@ -11,12 +11,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Patch
 
+# Okabe-Ito based palette (colour-vision-deficiency safe), one hue per interaction type.
 COLORS = {
-    "Hydrogen bond": "#2563EB", "Hydrophobic": "#737373",
-    "π–π stacking": "#16A34A", "Salt bridge": "#DCA500",
-    "π–cation": "#EA580C", "Halogen bond": "#0D9488",
-    "Water bridge": "#7DD3FC", "Metal coordination": "#9333EA",
-    "Other": "#A3A3A3",
+    "Hydrogen bond": "#0072B2", "Hydrophobic": "#999999",
+    "π–π stacking": "#009E73", "Salt bridge": "#F0E442",
+    "π–cation": "#D55E00", "Halogen bond": "#56B4E9",
+    "Water bridge": "#CC79A7", "Metal coordination": "#E69F00",
+    "Other": "#CCCCCC",
 }
 TYPE_ALIASES = {
     "hydrogen_bond": "Hydrogen bond", "hbond": "Hydrogen bond", "hydrogen bond": "Hydrogen bond",
@@ -28,6 +29,18 @@ TYPE_ALIASES = {
     "water_bridge": "Water bridge", "water bridge": "Water bridge",
     "metal_complex": "Metal coordination", "metal coordination": "Metal coordination",
 }
+
+
+def _present(fig, name, show, save_dir):
+    """Save (optional), then show or close, so notebooks never draw a figure twice."""
+    if save_dir is not None:
+        out = Path(save_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out / f"{name}.png", dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def _read(obj, filename):
@@ -118,7 +131,7 @@ def _residues(d, sort):
     raise ValueError("residue_sort must be 'sequence' or 'frequency'")
 
 
-def plot_interaction_fingerprint(d, jobs, *, residue_sort="sequence", max_residues=None):
+def plot_interaction_fingerprint(d, jobs, *, residue_sort="sequence", max_residues=None, show=True, save_dir=None):
     residues = _residues(d, residue_sort)
     if max_residues is not None:
         residues = residues[:max_residues]
@@ -133,15 +146,15 @@ def plot_interaction_fingerprint(d, jobs, *, residue_sort="sequence", max_residu
     ax.set_xlim(0,len(residues)); ax.set_ylim(len(jobs),0)
     ax.set_xticks(np.arange(len(residues))+.5, residues, rotation=90)
     ax.set_yticks(np.arange(len(jobs))+.5, jobs)
-    ax.xaxis.tick_top(); ax.set_title("Protein–ligand interaction fingerprint",pad=28)
+    ax.xaxis.tick_top(); ax.set_title(f"Protein–ligand interaction fingerprint ({len(jobs)} ligands, {len(residues)} residues)",pad=28)
     present = set(d._type)
     ax.legend(handles=[Patch(color=c,label=t) for t,c in COLORS.items() if t in present],
               loc="upper left",bbox_to_anchor=(1.01,1),title="Interaction")
-    fig.tight_layout(); plt.show()
+    fig.tight_layout(); _present(fig, "interaction_fingerprint", show, save_dir)
     return fig
 
 
-def plot_interaction_counts(d, jobs):
+def plot_interaction_counts(d, jobs, show=True, save_dir=None):
     counts = pd.crosstab(d._job,d._type).reindex(jobs,fill_value=0)
     fig, ax = plt.subplots(figsize=(max(9,len(jobs)*.55),5))
     bottom = np.zeros(len(jobs))
@@ -153,22 +166,22 @@ def plot_interaction_counts(d, jobs):
     ax.set_xticks(range(len(jobs)),jobs,rotation=90)
     ax.set_ylabel("Detected interaction records");ax.set_title("Interactions by ligand")
     ax.legend(bbox_to_anchor=(1.01,1),loc="upper left")
-    fig.tight_layout();plt.show()
+    fig.tight_layout();_present(fig, "interaction_counts", show, save_dir)
     return fig
 
 
-def plot_residue_conservation(d, jobs):
+def plot_residue_conservation(d, jobs, show=True, save_dir=None):
     freq = d.groupby("_residue")._job.nunique().sort_values(ascending=False)
     fig,ax=plt.subplots(figsize=(max(9,len(freq)*.4),4.5))
     ax.bar(range(len(freq)),freq.to_numpy())
     ax.set_xticks(range(len(freq)),freq.index,rotation=90)
     ax.set_ylim(0,max(len(jobs),1));ax.set_ylabel("Ligands with interaction")
     ax.set_title("Residue conservation across analyzed ligands")
-    fig.tight_layout();plt.show()
+    fig.tight_layout();_present(fig, "residue_conservation", show, save_dir)
     return fig
 
 
-def plot_similarity(d, jobs):
+def plot_similarity(d, jobs, show=True, save_dir=None):
     features={j:set() for j in jobs}
     for job,res,typ in d[["_job","_residue","_type"]].itertuples(index=False,name=None):
         if job in features:
@@ -187,14 +200,16 @@ def plot_similarity(d, jobs):
     ax.set_yticks(range(len(jobs)),jobs)
     ax.set_title("Interaction fingerprint similarity (Tanimoto)")
     fig.colorbar(im,ax=ax,label="Tanimoto similarity")
-    fig.tight_layout();plt.show()
+    fig.tight_layout();_present(fig, "interaction_similarity", show, save_dir)
     return fig
 
 
 def plot_interaction_summary(details="hit_expander_output/interaction_analysis", *, status=None,
                              results=None, ligand_sort="name", residue_sort="sequence",
-                             max_residues=None):
+                             max_residues=None, show=True, save_dir=None):
     """Display 4 Matplotlib figures in Jupyter. Return their Figure objects.
+
+    show=False suppresses display; save_dir writes each figure as a 200-dpi PNG.
 
     details: DataFrame, CSV file, or interaction-analysis directory.
     status: optional DataFrame/CSV; autodetected when details is a directory.
@@ -211,8 +226,8 @@ def plot_interaction_summary(details="hit_expander_output/interaction_analysis",
     if d.empty:
         raise ValueError("There are no interactions to plot; inspect interaction_status.csv and PLIP results")
     return {
-        "fingerprint":plot_interaction_fingerprint(d,jobs,residue_sort=residue_sort,max_residues=max_residues),
-        "counts":plot_interaction_counts(d,jobs),
-        "conservation":plot_residue_conservation(d,jobs),
-        "similarity":plot_similarity(d,jobs),
+        "fingerprint":plot_interaction_fingerprint(d,jobs,residue_sort=residue_sort,max_residues=max_residues,show=show,save_dir=save_dir),
+        "counts":plot_interaction_counts(d,jobs,show=show,save_dir=save_dir),
+        "conservation":plot_residue_conservation(d,jobs,show=show,save_dir=save_dir),
+        "similarity":plot_similarity(d,jobs,show=show,save_dir=save_dir),
     }

@@ -1,5 +1,5 @@
 # Local experiment outputs (potentially large / proprietary)
-hit_expander_output/
+hit_expander_output*/
 # Python
 __pycache__/
 *.py[cod]

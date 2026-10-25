@@ -5,6 +5,11 @@ import json, math, re, shutil, subprocess
 import pandas as pd
 import yaml
 from rdkit import Chem
+
+from .jobcache import (
+    CofoldCache, cache_key, job_msa_path, ligand_key, prediction_directory,
+    protein_sequence_from_job, set_job_msa, file_digest,
+)
 def _clean_protein_sequence(sequence):
     cleaned = re.sub(r"\s+", "", sequence).upper()
     if not cleaned:
@@ -53,6 +58,8 @@ def build_boltz2_manifest(hit_run, max_analogues=None):
             "is_parent": True,
             "morgan_tanimoto": 1.0,
             "boltz_atom_count": _boltz_ligand_atom_count(smiles),
+            "ligand_key": ligand_key(smiles),
+            "prefilter_flags": "",
         })
 
     analogues = hit_run["passed"].copy()
@@ -70,15 +77,20 @@ def build_boltz2_manifest(hit_run, max_analogues=None):
             "is_parent": False,
             "morgan_tanimoto": row["morgan_tanimoto"],
             "boltz_atom_count": _boltz_ligand_atom_count(smiles),
+            "ligand_key": ligand_key(smiles),
+            "prefilter_flags": row.get("prefilter_flags", "") if hasattr(row, "get") else "",
         })
 
     manifest = pd.DataFrame(records)
     if manifest["job_id"].duplicated().any():
         raise ValueError("Duplicate Boltz job IDs were generated")
     if (manifest["boltz_atom_count"] > 128).any():
-        oversized = manifest.loc[manifest["boltz_atom_count"] > 128]
-        display(oversized)
-        raise ValueError("A ligand exceeds the Boltz affinity limit of 128 atoms")
+        oversized = manifest.loc[manifest["boltz_atom_count"] > 128, ["job_id", "boltz_atom_count"]]
+        raise ValueError(
+            "A ligand exceeds the Boltz affinity limit of 128 atoms:\n"
+            + oversized.to_string(index=False)
+            + "\nDrop these (see open_hit_expander.prefilter) or lower max_analogues."
+        )
     if (manifest["boltz_atom_count"] > 56).any():
         print("Warning: a ligand exceeds the recommended 56-atom affinity range")
     return manifest
@@ -169,6 +181,8 @@ def prepare_boltz2_batch(
         "command": command,
         "screening_preset": screening_preset,
         "screening_settings": {"diffusion_samples": diffusion_samples},
+        "protein_sequence": sequence,
+        "msa_path": str(msa_path) if msa_path is not None else None,
     }
 def _read_json(path):
     with Path(path).open() as handle:
@@ -337,12 +351,95 @@ SCREENING_PRESETS = {"balanced": {"diffusion_samples": 3}, "quick": {"diffusion_
 
 
 # Integrated cofolding replicates: this is the ONLY inference stage.
-def run_boltz2_replicates(state, n_replicates=1, seeds=None, overwrite=False):
-    """Run the prepared YAML batch exactly once per chosen seed, never again downstream.
+def _is_true(series):
+    return series.astype(str).str.lower().isin(["true", "1"])
 
-    Each replicate is stored in its own directory. Existing successful CSV
-    results are reused unless overwrite=True. A replicate is a full Boltz predict
-    call (structure + affinity), not extra inference performed during analysis.
+
+def _strip_flag(command, flag):
+    return [c for c in command if c != flag]
+
+
+def _replicate_dir(batches, index, seed):
+    return batches / f"replicate_{index:02d}_seed_{seed}"
+
+
+def _resolve_cache_roots(state, cache_dir):
+    """Return (cofold_cache_root | None, msa_cache_root). ``"auto"`` puts both
+    next to the run folders: <output_directory>/cofold_cache and /msa_cache."""
+    if cache_dir is None:
+        return None, Path(state["root"]).resolve().parent.parent / "msa_cache"
+    if cache_dir == "auto":
+        base = Path(state["root"]).resolve().parent.parent
+        return base / "cofold_cache", base / "msa_cache"
+    base = Path(cache_dir).expanduser().resolve()
+    return base / "cofold_cache", base / "msa_cache"
+
+
+def _msa_tag(job_yaml, msa_root):
+    """"server" for MSAs we generated from the server; a file digest for a user MSA."""
+    msa = job_msa_path(job_yaml)
+    if not msa:
+        return "server"
+    msa = Path(msa)
+    try:
+        msa.resolve().relative_to(Path(msa_root).resolve())
+        return "server"  # our own cached server MSA
+    except ValueError:
+        return file_digest(msa) if msa.is_file() else "server"
+
+
+def plan_boltz2_replicates(state, n_replicates=1, seeds=None, cache_dir="auto"):
+    """Dry run: how much cofolding is still needed? Launches nothing.
+
+    Returns one row per (replicate, seed) with the number of jobs that are
+    already finished on disk, restorable from the cache, and still pending.
+    """
+    seeds = list(range(1001, 1001 + n_replicates)) if seeds is None else list(seeds)
+    manifest = state["manifest"]
+    batches = Path(state["root"]).resolve() / "replicates"
+    cache_root, msa_root = _resolve_cache_roots(state, cache_dir)
+    cache = CofoldCache(cache_root) if cache_root is not None else None
+    jobs_dir = Path(state["job_directory"])
+    sequence = state.get("protein_sequence")
+    rows = []
+    for index, seed in enumerate(seeds, 1):
+        output = _replicate_dir(batches, index, seed) / "results"
+        done = cached = pending = 0
+        for record in manifest.to_dict(orient="records"):
+            job_id = str(record["job_id"])
+            if parse_boltz2_prediction(job_id, output)["cofold_status"] == "success":
+                done += 1
+                continue
+            hit = False
+            if cache is not None and (jobs_dir / f"{job_id}.yaml").is_file():
+                seq = sequence or protein_sequence_from_job(jobs_dir / f"{job_id}.yaml")
+                key = cache_key(seq, record["ligand_smiles"], seed, state["command"],
+                                _msa_tag(jobs_dir / f"{job_id}.yaml", msa_root))
+                hit = cache.has(key)
+            cached += hit
+            pending += not hit
+        rows.append({"replicate": index, "seed": seed, "jobs": len(manifest),
+                     "done_on_disk": done, "in_cache": cached, "to_compute": pending})
+    return pd.DataFrame(rows)
+
+
+def run_boltz2_replicates(state, n_replicates=1, seeds=None, overwrite=False,
+                          *, cache_dir="auto", reuse_msa=True, log=print):
+    """Run the prepared YAML batch once per seed; resumable per job.
+
+    Each replicate lives in ``replicates/replicate_NN_seed_S`` as before. Work is
+    tracked per job (a job is finished when its structure, confidence and
+    affinity files parse), so after a crash or interrupt, calling this again
+    runs only the unfinished jobs. Earlier versions raised ``FileExistsError``
+    and required ``overwrite=True``, which deleted the finished jobs too.
+
+    cache_dir : "auto" (default) keeps a cross-run prediction cache and an MSA
+        cache beside the run folders; a path puts both there; None disables the
+        prediction cache. A cached prediction is reused when protein sequence,
+        ligand SMILES, seed and prediction settings all match.
+    reuse_msa : compute the target MSA once and reuse it for every replicate
+        when the batch was prepared with ``--use_msa_server``.
+    overwrite : delete and redo the replicate folders (explicit opt-in only).
     """
     import time
     if not isinstance(n_replicates, int) or n_replicates < 1:
@@ -350,64 +447,136 @@ def run_boltz2_replicates(state, n_replicates=1, seeds=None, overwrite=False):
     seeds = list(range(1001, 1001 + n_replicates)) if seeds is None else list(seeds)
     if len(seeds) != n_replicates or len(set(seeds)) != n_replicates:
         raise ValueError("Supply one distinct seed per replicate")
-    original_jobs = Path(state['job_directory']).resolve()
+    original_jobs = Path(state["job_directory"]).resolve()
     if not original_jobs.is_dir():
         raise FileNotFoundError(original_jobs)
-    manifest = state['manifest']
+    manifest = state["manifest"]
     if manifest is None or manifest.empty:
         raise ValueError("Empty manifest")
     from .stability import _replace_command
-    root = Path(state['root']).resolve()
-    batches = root / 'replicates'
+    root = Path(state["root"]).resolve()
+    batches = root / "replicates"
     batches.mkdir(parents=True, exist_ok=True)
+
+    cache_root, msa_root = _resolve_cache_roots(state, cache_dir)
+    cache = CofoldCache(cache_root) if cache_root is not None else None
+
+    base_command = [str(c) for c in state["command"]]
+    msa_file = None
+    if reuse_msa and "--use_msa_server" in base_command:
+        from .msa import ensure_target_msa
+        msa_file = ensure_target_msa(state, msa_root, seed=seeds[0], log=log)
+        if msa_file is not None:
+            base_command = _strip_flag(base_command, "--use_msa_server")
+
+    sequence = state.get("protein_sequence") or protein_sequence_from_job(
+        next(iter(sorted(original_jobs.glob("*.yaml")))))
+    records = manifest.to_dict(orient="records")
     all_results, statuses = [], []
+
     for index, seed in enumerate(seeds, 1):
-        run_dir = batches / f'replicate_{index:02d}_seed_{seed}'
-        jobs, output = run_dir/'jobs', run_dir/'results'
-        cache = run_dir/'replicate_results.csv'
-        if cache.exists() and not overwrite:
-            df = pd.read_csv(cache)
-            if set(df['job_id'].astype(str)) != set(manifest['job_id'].astype(str)):
-                raise ValueError(f"Cached manifest mismatch in {cache}")
-            if not df['cofold_status'].eq('success').all():
-                parsed = pd.DataFrame([parse_boltz2_prediction(str(j), output) for j in manifest['job_id']])
-                df = manifest.merge(parsed, on='job_id', how='left')
-                df.to_csv(cache, index=False)
-            status = 'cached'
-        else:
-            if run_dir.exists() and not overwrite:
-                raise FileExistsError(f"Incomplete previous replicate: {run_dir}")
-            if run_dir.exists():
-                shutil.rmtree(run_dir)
-            run_dir.mkdir(parents=True)
+        run_dir = _replicate_dir(batches, index, seed)
+        jobs, output = run_dir / "jobs", run_dir / "results"
+        if overwrite and run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if not jobs.is_dir():
             shutil.copytree(original_jobs, jobs)
-            cmd = _replace_command(state['command'], original_jobs, state['output_directory'], jobs, output, seed)
-            (run_dir/'command.json').write_text(json.dumps(cmd, indent=2))
-            started = time.monotonic()
-            with (run_dir/'boltz.log').open('w') as log:
-                proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)
-            if proc.returncode:
-                statuses.append(dict(replicate=index, seed=seed, status='failed', error=f"Boltz exit {proc.returncode}; {run_dir/'boltz.log'}"))
+            if msa_file is not None:
+                for yaml_file in jobs.glob("*.yaml"):
+                    set_job_msa(yaml_file, msa_file)
+        output.mkdir(parents=True, exist_ok=True)
+
+        # 1. Triage: finished on disk / restorable from cache / still to compute.
+        source, pending = {}, []
+        for record in records:
+            job_id = str(record["job_id"])
+            if parse_boltz2_prediction(job_id, output)["cofold_status"] == "success":
+                source[job_id] = "existing"
                 continue
-            run_state = dict(state, root=run_dir, job_directory=jobs, output_directory=output,
-                             manifest=manifest.copy())
+            if cache is not None:
+                key = cache_key(sequence, record["ligand_smiles"], seed, base_command,
+                                _msa_tag(jobs / f"{job_id}.yaml", msa_root))
+                stale = prediction_directory(output, job_id)
+                if stale.exists():
+                    shutil.rmtree(stale)  # incomplete leftovers of an earlier attempt
+                if cache.restore(key, prediction_directory(output, job_id), job_id):
+                    source[job_id] = "cache"
+                    continue
+            pending.append(job_id)
+
+        # 2. Compute only what is missing.
+        started = time.monotonic()
+        exit_code, error = 0, ""
+        try:
+            if pending:
+                staging = run_dir / "_pending"
+                shutil.rmtree(staging, ignore_errors=True)
+                (staging / "jobs").mkdir(parents=True)
+                for job_id in pending:
+                    shutil.copy2(jobs / f"{job_id}.yaml", staging / "jobs" / f"{job_id}.yaml")
+                    stale = prediction_directory(output, job_id)
+                    if stale.exists():
+                        shutil.rmtree(stale)
+                # Input folder must be named "jobs" so results land in
+                # results/boltz_results_jobs/, the layout older runs and the
+                # notebook viewer expect.
+                command = _replace_command(base_command, original_jobs, state["output_directory"],
+                                           staging / "jobs", output, seed)
+                (run_dir / "command.json").write_text(json.dumps(command, indent=2))
+                log(f"Replicate {index} (seed {seed}): computing {len(pending)} of {len(records)} jobs"
+                    f" ({sum(v == 'existing' for v in source.values())} finished, "
+                    f"{sum(v == 'cache' for v in source.values())} from cache)")
+                with (run_dir / "boltz.log").open("a") as log_file:
+                    completed = subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT, check=False)
+                exit_code = completed.returncode
+        finally:
+            # 3. Harvest whatever finished (also after a crash or Ctrl-C).
+            for job_id in pending:
+                if parse_boltz2_prediction(job_id, output)["cofold_status"] == "success":
+                    source[job_id] = "computed"
+                    if cache is not None:
+                        record = next(r for r in records if str(r["job_id"]) == job_id)
+                        key = cache_key(sequence, record["ligand_smiles"], seed, base_command,
+                                        _msa_tag(jobs / f"{job_id}.yaml", msa_root))
+                        cache.store(key, prediction_directory(output, job_id), job_id)
+            shutil.rmtree(run_dir / "_pending", ignore_errors=True)
+            pd.DataFrame(
+                [{"job_id": str(r["job_id"]), "status": source.get(str(r["job_id"]), "pending")}
+                 for r in records]
+            ).to_csv(run_dir / "job_status.csv", index=False)
+
+        n_done = len(source)
+        if exit_code and n_done < len(records):
+            error = f"Boltz exit {exit_code}; see {run_dir / 'boltz.log'}"
+        run_state = dict(state, root=run_dir, job_directory=jobs, output_directory=output,
+                         manifest=manifest.copy())
+        if n_done:
             df, _ = collect_boltz2_results(run_state)
-            df['replicate'] = index
-            df['seed'] = seed
-            df.to_csv(cache, index=False)
-            status = 'ok'
-        df['replicate'] = index
-        df['seed'] = seed
-        all_results.append(df)
-        statuses.append(dict(replicate=index, seed=seed, status=status, error=''))
-    records = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
-    state['replicate_results'] = records
-    state['replicate_status'] = pd.DataFrame(statuses)
-    records.to_csv(root/'replicate_predictions.csv', index=False)
-    state['replicate_status'].to_csv(root/'replicate_status.csv', index=False)
-    if records.empty:
+            df["replicate"] = index
+            df["seed"] = seed
+            df.to_csv(run_dir / "replicate_results.csv", index=False)
+            all_results.append(df)
+        status = "failed" if n_done == 0 else "ok" if n_done == len(records) else "partial"
+        statuses.append(dict(
+            replicate=index, seed=seed, status=status, error=error,
+            n_jobs=len(records), n_success=n_done,
+            n_existing=sum(v == "existing" for v in source.values()),
+            n_cache=sum(v == "cache" for v in source.values()),
+            n_computed=sum(v == "computed" for v in source.values()),
+            seconds=round(time.monotonic() - started, 1),
+        ))
+
+    records_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    state["replicate_results"] = records_df
+    state["replicate_status"] = pd.DataFrame(statuses)
+    records_df.to_csv(root / "replicate_predictions.csv", index=False)
+    state["replicate_status"].to_csv(root / "replicate_status.csv", index=False)
+    if records_df.empty:
         raise RuntimeError("No successful Boltz predictions. Inspect per-replicate boltz.log files")
-    return records, state['replicate_status']
+    if (state["replicate_status"]["status"] == "partial").any():
+        log("Some jobs are still unfinished; call run_boltz2_replicates again to resume.")
+    return records_df, state["replicate_status"]
 
 
 def collect_boltz2_replicate_results(state):
